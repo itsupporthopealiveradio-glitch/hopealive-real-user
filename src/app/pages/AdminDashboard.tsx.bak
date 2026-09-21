@@ -1,0 +1,1438 @@
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { useNavigate } from "react-router";
+import { Button } from "../components/ui/button";
+import { Card } from "../components/ui/card";
+import {
+  LogOut, Users, FileText, Activity, Download, Plus, Trash2, X,
+  Clock, UserCheck, Timer, TrendingUp, ChevronDown, AlertTriangle,
+  CheckCircle2, Loader2, Camera
+} from "lucide-react";
+import { supabase } from "../../lib/supabase";
+import { Directory, Filesystem } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
+import { Capacitor } from '@capacitor/core';
+import * as faceapi from "@vladmandic/face-api";
+import { motion, AnimatePresence } from "framer-motion";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+type DateFilter = "today" | "week" | "month" | "all";
+
+interface Employee {
+  id: string;
+  auth_user_id: string | null;
+  full_name: string;
+  email: string;
+  department?: string;
+  role: string;
+  onboarding_status: string;
+  created_at: string;
+}
+
+interface AttendanceRecord {
+  id: string;
+  employee_id: string;
+  clock_in_at: string;
+  clock_out_at: string | null;
+  status: string;
+  created_at: string;
+  employees: { full_name: string; department?: string; } | null;
+}
+
+interface AuditLog {
+  id: string;
+  action: string;
+  result: string;
+  ip_address: string | null;
+  device_info: string | null;
+  created_at: string;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function getDateRange(filter: DateFilter): { from: Date | null; to: Date } {
+  const now = new Date();
+  const to = now;
+  switch (filter) {
+    case "today": {
+      const from = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return { from, to };
+    }
+    case "week": {
+      const day = now.getDay();
+      const diff = now.getDate() - day + (day === 0 ? -6 : 1); // Monday start
+      const from = new Date(now.getFullYear(), now.getMonth(), diff);
+      from.setHours(0, 0, 0, 0);
+      return { from, to };
+    }
+    case "month": {
+      const from = new Date(now.getFullYear(), now.getMonth(), 1);
+      return { from, to };
+    }
+    case "all":
+    default:
+      return { from: null, to };
+  }
+}
+
+function calcHours(clockIn: string, clockOut: string | null): string {
+  const start = new Date(clockIn).getTime();
+  const end = clockOut ? new Date(clockOut).getTime() : Date.now();
+  const diffMs = Math.max(0, end - start);
+  const hours = Math.floor(diffMs / 3_600_000);
+  const mins = Math.floor((diffMs % 3_600_000) / 60_000);
+  return `${hours}h ${mins}m`;
+}
+
+function calcHoursNum(clockIn: string, clockOut: string | null): number {
+  const start = new Date(clockIn).getTime();
+  const end = clockOut ? new Date(clockOut).getTime() : Date.now();
+  return Math.max(0, (end - start) / 3_600_000);
+}
+
+function formatDecimalHours(decimalHours: number): string {
+  const h = Math.floor(decimalHours);
+  const m = Math.floor((decimalHours - h) * 60);
+  return `${h}h ${m}m`;
+}
+
+function parseGuestNames(rawName: string): string {
+  try {
+    const parsed = JSON.parse(rawName);
+    if (Array.isArray(parsed)) return parsed.join(", ");
+    return rawName;
+  } catch {
+    return rawName;
+  }
+}
+
+function statusColor(status: string) {
+  switch (status) {
+    case "verified":
+      return "bg-emerald-500/20 text-emerald-400 border-emerald-500/30";
+    case "rejected":
+      return "bg-red-500/20 text-red-400 border-red-500/30";
+    case "pending":
+    default:
+      return "bg-yellow-500/20 text-yellow-400 border-yellow-500/30";
+  }
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+export default function AdminDashboard() {
+  const navigate = useNavigate();
+  const [activeTab, setActiveTab] = useState<"employees" | "attendance" | "audit" | "hours_month" | "avg_hours" | "guests">("employees");
+  const [attendanceStatusFilter, setAttendanceStatusFilter] = useState<"all" | "in_progress" | "complete">("all");
+  const [isLoading, setIsLoading] = useState(true);
+
+  // Data
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [guestInvites, setGuestInvites] = useState<any[]>([]);
+
+  // Add Employee Modal
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [newFirstName, setNewFirstName] = useState("");
+  const [newLastName, setNewLastName] = useState("");
+  const [newIdNumber, setNewIdNumber] = useState("");
+  const [newDepartment, setNewDepartment] = useState("");
+  const [newEmail, setNewEmail] = useState("");
+  const [newRole, setNewRole] = useState<"employee" | "admin" | "security_officer">("employee");
+  const [addLoading, setAddLoading] = useState(false);
+  const [addStatus, setAddStatus] = useState("");
+  const [addError, setAddError] = useState("");
+  const [addSuccess, setAddSuccess] = useState("");
+  const [referenceImage, setReferenceImage] = useState<File | null>(null);
+  const [faceModelsLoaded, setFaceModelsLoaded] = useState(false);
+
+  // Modals
+  const [deleteTarget, setDeleteTarget] = useState<Employee | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [selectedEmployeeStats, setSelectedEmployeeStats] = useState<Employee | null>(null);
+
+  // Filters
+  const [dateFilter, setDateFilter] = useState<DateFilter>("today");
+  const [departmentFilter, setDepartmentFilter] = useState<string>("all");
+
+  // Toast
+  const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
+
+  // ── Show toast ──
+  const showToast = useCallback((message: string, type: "success" | "error") => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 3500);
+  }, []);
+
+  // ── Init auth guard ──
+  useEffect(() => {
+    const init = async () => {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData?.session) {
+        navigate("/");
+        return;
+      }
+
+      // Check if Admin
+      const { data: employeeData } = await supabase
+        .from("employees")
+        .select("role")
+        .eq("auth_user_id", sessionData.session.user.id)
+        .maybeSingle();
+
+      const isRafuma = sessionData.session.user.email?.toLowerCase() === "rafuma55@gmail.com";
+      if (!isRafuma && employeeData?.role !== "admin") {
+        navigate("/dashboard");
+        return;
+      }
+
+      await fetchData();
+      setIsLoading(false);
+    };
+
+    init();
+
+    // Load face-api models for reference extraction
+    const loadModels = async () => {
+      try {
+        const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.3/model/";
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+        ]);
+        setFaceModelsLoaded(true);
+      } catch (err) {
+        console.error("Error loading face models", err);
+      }
+    };
+    loadModels();
+    
+    // Real-time auto refresh every 10 seconds
+    const interval = setInterval(fetchData, 10000);
+    return () => clearInterval(interval);
+  }, [navigate]);
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    navigate("/");
+  };
+
+  // ── Fetch all data ──
+  const fetchData = async () => {
+    const [empsRes, attRes, auditRes, guestRes] = await Promise.all([
+      supabase.from("employees").select("*").eq('status', 'active').order("created_at", { ascending: false }),
+      supabase.from("attendance_records").select("*, employees(full_name, department)").order("clock_in_at", { ascending: false }),
+      supabase.from("audit_log").select("*").order("created_at", { ascending: false }).limit(50),
+      supabase.from("guest_invites").select("*, employees!host_employee_id(full_name)").order("created_at", { ascending: false }).limit(100),
+    ]);
+    if (empsRes.data) setEmployees(empsRes.data);
+    if (attRes.data) setAttendance(attRes.data);
+    if (auditRes.data) setAuditLogs(auditRes.data);
+    if (guestRes.data) setGuestInvites(guestRes.data);
+  };
+
+  // ── Filtered data ──
+  const filteredEmployees = useMemo(() => {
+    if (departmentFilter === "all") return employees;
+    return employees.filter(e => e.department?.toLowerCase() === departmentFilter.toLowerCase());
+  }, [employees, departmentFilter]);
+
+  const departmentFilteredAttendance = useMemo(() => {
+    if (departmentFilter === "all") return attendance;
+    return attendance.filter(r => r.employees?.department?.toLowerCase() === departmentFilter.toLowerCase());
+  }, [attendance, departmentFilter]);
+
+  const tableFilteredAttendance = useMemo(() => {
+    let result = departmentFilteredAttendance;
+    
+    const { from } = getDateRange(dateFilter);
+    if (from) {
+      result = result.filter((r) => new Date(r.clock_in_at) >= from);
+    }
+
+    if (attendanceStatusFilter !== "all") {
+      result = result.filter(r => r.status === attendanceStatusFilter);
+    }
+    
+    return result;
+  }, [departmentFilteredAttendance, dateFilter, attendanceStatusFilter]);
+
+  const groupedTableAttendance = useMemo(() => {
+    const grouped = new Map<string, any>();
+
+    tableFilteredAttendance.forEach((record) => {
+      const dateStr = new Date(record.clock_in_at).toLocaleDateString("en-GB");
+      const empId = record.employee_id;
+      const key = `${empId}_${dateStr}`;
+
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          id: key,
+          employee: record.employees,
+          date: new Date(record.clock_in_at).toLocaleDateString("en-US", { weekday: 'short', month: 'short', day: 'numeric' }),
+          rawDate: new Date(record.clock_in_at),
+          totalHours: calcHoursNum(record.clock_in_at, record.clock_out_at),
+          clockOutCount: record.clock_out_at ? 1 : 0,
+          inProgress: !record.clock_out_at,
+          firstClockIn: record.clock_in_at,
+          lastClockOut: record.clock_out_at
+        });
+      } else {
+        const existing = grouped.get(key);
+        existing.totalHours += calcHoursNum(record.clock_in_at, record.clock_out_at);
+        if (record.clock_out_at) existing.clockOutCount += 1;
+        if (!record.clock_out_at) existing.inProgress = true;
+        if (new Date(record.clock_in_at) < new Date(existing.firstClockIn)) existing.firstClockIn = record.clock_in_at;
+        if (record.clock_out_at && (!existing.lastClockOut || new Date(record.clock_out_at) > new Date(existing.lastClockOut))) {
+           existing.lastClockOut = record.clock_out_at;
+        }
+      }
+    });
+
+    return Array.from(grouped.values()).sort((a, b) => b.rawDate.getTime() - a.rawDate.getTime());
+  }, [tableFilteredAttendance]);
+
+  // ── Stats (Not affected by Date or Status filters, ONLY Department) ──
+  const stats = useMemo(() => {
+    const totalEmployees = filteredEmployees.length;
+    
+    // Clocked In Now
+    const clockedIn = departmentFilteredAttendance.filter((r) => !r.clock_out_at).length;
+
+    // This month
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+
+    const monthRecords = departmentFilteredAttendance.filter((r) => new Date(r.clock_in_at) >= monthStart);
+    const totalHoursMonthRaw = monthRecords.reduce((sum, r) => sum + calcHoursNum(r.clock_in_at, r.clock_out_at), 0);
+    const totalHoursMonth = Math.round(totalHoursMonthRaw * 10) / 10;
+
+    // Days this month with records
+    const uniqueDays = new Set(
+      monthRecords.map((r) => new Date(r.clock_in_at).toDateString())
+    );
+    const totalDaysWorked = uniqueDays.size;
+
+    // Today
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const clockedOutToday = departmentFilteredAttendance.filter(r => r.clock_out_at && new Date(r.clock_out_at) >= todayStart).length;
+
+    return { totalEmployees, clockedIn, clockedOutToday, totalHoursMonth, totalDaysWorked };
+  }, [filteredEmployees, departmentFilteredAttendance]);
+
+  // ── Employee Stats (for new tabs) ──
+  const employeeStatsMonth = useMemo(() => {
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+
+    const monthRecords = departmentFilteredAttendance.filter((r) => new Date(r.clock_in_at) >= monthStart);
+    
+    return filteredEmployees.map(emp => {
+      const empRecords = monthRecords.filter(r => r.employee_id === emp.id);
+      const totalHoursRaw = empRecords.reduce((sum, r) => sum + calcHoursNum(r.clock_in_at, r.clock_out_at), 0);
+      const totalHours = Math.round(totalHoursRaw * 10) / 10;
+      
+      const uniqueDays = new Set(
+        empRecords.map((r) => new Date(r.clock_in_at).toDateString())
+      );
+      const daysWorked = uniqueDays.size;
+
+      return { emp, totalHours, daysWorked };
+    }).filter(s => s.totalHours > 0);
+  }, [filteredEmployees, departmentFilteredAttendance]);
+
+  // ── Departments List ──
+  const uniqueDepartments = useMemo(() => {
+    const deps = new Set(employees.map(e => e.department).filter(Boolean) as string[]);
+    return Array.from(deps).sort();
+  }, [employees]);
+
+  // ── Add Employee ──
+  const handleAddEmployee = async () => {
+    setAddError("");
+    setAddSuccess("");
+    setAddStatus("");
+
+    if (!newFirstName.trim() || !newLastName.trim() || !newEmail.trim() || !newIdNumber.trim() || !newDepartment.trim()) {
+      setAddError("All text fields are required.");
+      return;
+    }
+
+    if (!referenceImage) {
+      setAddError("Please upload a reference photo for the employee's Face ID.");
+      return;
+    }
+
+    if (!faceModelsLoaded) {
+      setAddError("Biometric models are still loading. Please wait a moment.");
+      return;
+    }
+
+    // Basic email validation
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail.trim())) {
+      setAddError("Please enter a valid email address.");
+      return;
+    }
+
+    setAddLoading(true);
+    setAddStatus("Checking database...");
+    try {
+      // Check for duplicates
+      const { data: existing } = await supabase
+        .from("employees")
+        .select("id, status")
+        .eq("email", newEmail.trim().toLowerCase())
+        .maybeSingle();
+
+      if (existing && existing.status === 'active') {
+        setAddError("An employee with this email already exists.");
+        setAddLoading(false);
+        return;
+      }
+
+      setAddStatus("Extracting biometric signature from photo...");
+      
+      // Process reference image
+      const img = document.createElement("img");
+      img.src = URL.createObjectURL(referenceImage);
+      await new Promise((resolve) => {
+        img.onload = resolve;
+      });
+
+      const detection = await faceapi
+        .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 }))
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+
+      if (!detection) {
+        setAddError("Could not detect a clear face in the uploaded photo. Please try a front-facing photo with good lighting.");
+        setAddLoading(false);
+        return;
+      }
+
+      const referenceDescriptorArray = Array.from(detection.descriptor);
+
+      setAddStatus("Fetching organization data...");
+      const { data: orgData } = await supabase.from("organizations").select("id").limit(1).maybeSingle();
+      
+      let orgId = orgData?.id;
+      
+      // If no org exists, gracefully create one (fallback)
+      if (!orgId) {
+        setAddStatus("Initializing default organization...");
+        const { data: newOrg } = await supabase.from("organizations").insert({
+          name: 'Hope Alive Headquarters',
+          address: 'HQ',
+          office_latitude: 0,
+          office_longitude: 0,
+          geofence_radius_meters: 150
+        }).select("id").single();
+        orgId = newOrg?.id;
+      }
+
+      setAddStatus("Saving to database...");
+
+      const fullName = `${newFirstName.trim()} ${newLastName.trim()}`;
+
+      const employeeData = {
+        org_id: orgId,
+        first_name: newFirstName.trim(),
+        last_name: newLastName.trim(),
+        full_name: fullName,
+        id_number: newIdNumber.trim(),
+        department: newDepartment.trim(),
+        email: newEmail.trim().toLowerCase(),
+        role: newRole,
+        status: "active",
+        onboarding_status: "pending",
+        reference_descriptor: referenceDescriptorArray
+      };
+
+      let dbError;
+      if (existing && existing.status === 'terminated') {
+        // Reactivate soft-deleted employee
+        const { error: updateError } = await supabase.from("employees").update(employeeData).eq("id", existing.id);
+        dbError = updateError;
+      } else {
+        const { error: insertError } = await supabase.from("employees").insert(employeeData);
+        dbError = insertError;
+      }
+
+      if (dbError) throw dbError;
+
+      setAddSuccess("Employee added successfully!");
+      showToast(`${fullName} has been pre-authorized.`, "success");
+
+      // Reset form
+      setNewFirstName("");
+      setNewLastName("");
+      setNewIdNumber("");
+      setNewDepartment("");
+      setNewEmail("");
+      setNewRole("employee");
+      setReferenceImage(null);
+
+      setTimeout(() => {
+        setShowAddModal(false);
+        setAddLoading(false);
+        fetchData();
+      }, 1500);
+    } catch (err: any) {
+      setAddError(err.message || "Failed to add employee.");
+      setAddLoading(false);
+    }
+  };
+
+  // ── Delete Employee ──
+  const handleDeleteEmployee = async () => {
+    if (!deleteTarget) return;
+    setDeleteLoading(true);
+    try {
+      const { error } = await supabase.from("employees").delete().eq("id", deleteTarget.id);
+      if (error) throw error;
+
+      showToast(`${deleteTarget.full_name} has been removed.`, "success");
+      setDeleteTarget(null);
+      await fetchData();
+    } catch (err: any) {
+      showToast(err.message || "Failed to delete employee.", "error");
+    } finally {
+      setAddLoading(false);
+    }
+  };
+
+  // ── Export CSV ──
+  const handleExportCSV = async () => {
+    const data = tableFilteredAttendance;
+    if (data.length === 0) {
+      showToast("No records to export.", "error");
+      return;
+    }
+
+    const headers = "ID,Employee,Clock In,Clock Out,Hours Worked,Status\n";
+    const rows = data
+      .map((record) => {
+        const hours = calcHours(record.clock_in_at, record.clock_out_at);
+        return `${record.id},${record.employees?.full_name || "Unknown"},${record.clock_in_at},${record.clock_out_at || "N/A"},${hours},${record.status}`;
+      })
+      .join("\n");
+    const content = headers + rows;
+
+    try {
+      if (Capacitor.isNativePlatform()) {
+        const fileName = `attendance_${dateFilter}_${new Date().getTime()}.csv`;
+        const result = await Filesystem.writeFile({
+          path: fileName,
+          data: content,
+          directory: Directory.Cache,
+          encoding: "utf8" as any,
+        });
+
+        await Share.share({
+          title: "Export Attendance",
+          url: result.uri,
+          dialogTitle: "Share CSV Export",
+        });
+      } else {
+        const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `attendance_${dateFilter}_${new Date().getTime()}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+      showToast("CSV exported successfully!", "success");
+    } catch (err) {
+      console.error("Export failed", err);
+      showToast("Failed to export CSV.", "error");
+    }
+  };
+
+  // ── Loading screen ──
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-transparent flex items-center justify-center p-4">
+        <div className="flex flex-col items-center gap-3">
+          <span className="w-10 h-10 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+          <p className="text-gray-400 text-xs">Loading dashboard…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Render ────────────────────────────────────────────────────────────────
+  return (
+    <div className="min-h-screen bg-transparent p-4 pb-20">
+      <div className="w-full max-w-4xl mx-auto space-y-4">
+
+        {/* ═══ Header ═══ */}
+        <div className="flex items-center justify-between bg-black/60 backdrop-blur-xl border border-white/10 rounded-2xl p-4 shadow-2xl">
+          <div className="flex items-center gap-4">
+            <img
+              src="/logo.png"
+              alt="Hope Alive Radio"
+              className="w-9 h-9 rounded-lg object-contain"
+            />
+            <h1 className="text-lg font-bold text-white tracking-tight hidden sm:block">Admin Dashboard</h1>
+          </div>
+          
+          <div className="flex items-center gap-4">
+            {/* Global Department Filter */}
+            {uniqueDepartments.length > 0 && (
+              <div className="relative">
+                <select
+                  value={departmentFilter}
+                  onChange={(e) => setDepartmentFilter(e.target.value)}
+                  className="appearance-none bg-white/5 border border-white/10 rounded-xl pl-3 pr-8 py-1.5 text-xs font-semibold text-gray-300 outline-none focus:border-primary/50 transition-colors cursor-pointer"
+                >
+                  <option value="all">All Departments</option>
+                  {uniqueDepartments.map(d => (
+                    <option key={d} value={d}>{d}</option>
+                  ))}
+                </select>
+                <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-500 pointer-events-none" />
+              </div>
+            )}
+
+            <button
+              onClick={handleLogout}
+              className="p-2 hover:bg-red-500/10 rounded-xl transition-colors text-red-400 hover:text-red-300"
+              title="Sign out"
+            >
+              <LogOut size={18} />
+            </button>
+          </div>
+        </div>
+
+        {/* ═══ Stats Summary ═══ */}
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          {[
+            {
+              label: "Total Employees",
+              value: stats.totalEmployees,
+              icon: <Users size={16} className="text-primary" />,
+              color: "text-white",
+              onClick: () => setActiveTab("employees"),
+            },
+            {
+              label: "Clocked In Now",
+              value: stats.clockedIn,
+              icon: <UserCheck size={16} className="text-emerald-400" />,
+              color: "text-emerald-400",
+              onClick: () => {
+                setActiveTab("attendance");
+                setDateFilter("today");
+                setAttendanceStatusFilter("in_progress");
+              },
+            },
+            {
+              label: "Clocked Out Today",
+              value: stats.clockedOutToday,
+              icon: <Clock size={16} className="text-gray-400" />,
+              color: "text-gray-300",
+              onClick: () => {
+                setActiveTab("attendance");
+                setDateFilter("today");
+                setAttendanceStatusFilter("complete");
+              },
+            },
+            {
+              label: "Hours This Month",
+              value: stats.totalHoursMonth.toFixed(1),
+              icon: <Timer size={16} className="text-blue-400" />,
+              color: "text-blue-400",
+              onClick: () => setActiveTab("hours_month"),
+            },
+            {
+              label: "Days Worked",
+              value: stats.totalDaysWorked,
+              icon: <TrendingUp size={16} className="text-purple-400" />,
+              color: "text-purple-400",
+              onClick: () => setActiveTab("days_worked"),
+            },
+          ].map((s, idx) => (
+            <motion.div
+              key={s.label}
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: idx * 0.05, duration: 0.3 }}
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={s.onClick}
+              className="bg-black/60 backdrop-blur-xl border border-white/10 rounded-2xl p-4 flex flex-col gap-2 shadow-lg hover:border-white/30 cursor-pointer hover:bg-white/5 transition-colors"
+            >
+              <div className="flex items-center gap-2">
+                {s.icon}
+                <span className="text-[10px] uppercase tracking-wider text-gray-400">{s.label}</span>
+              </div>
+              <p className={`text-2xl font-bold ${s.color}`}>{s.value}</p>
+            </motion.div>
+          ))}
+        </div>
+
+        {/* ═══ Tabs ═══ */}
+        <div className="flex gap-2 bg-black/40 p-1.5 rounded-xl border border-white/5">
+          {([
+            { key: "employees" as const, label: "Employees", icon: <Users size={15} /> },
+            { key: "attendance" as const, label: "Attendance", icon: <FileText size={15} /> },
+            { key: "guests" as const, label: "Guests", icon: <UserCheck size={15} /> },
+            { key: "audit" as const, label: "Audit Log", icon: <Activity size={15} /> },
+          ]).map((tab) => (
+            <button
+              key={tab.key}
+              onClick={() => setActiveTab(tab.key)}
+              className={`flex-1 py-2.5 text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-all duration-200 ${
+                activeTab === tab.key
+                  ? "bg-primary text-black shadow-lg shadow-primary/20"
+                  : "text-gray-400 hover:text-white hover:bg-white/5"
+              }`}
+            >
+              {tab.icon} {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {/* ═══ Content Card ═══ */}
+        <div className="bg-black/60 backdrop-blur-xl border border-white/10 rounded-2xl p-4 md:p-6 shadow-2xl min-h-[420px]">
+
+          {/* ─── Employees Tab ─── */}
+          {activeTab === "employees" && (
+            <div className="space-y-4">
+              <div className="flex justify-between items-center">
+                <div className="flex items-center gap-3">
+                  <h2 className="text-base font-bold text-white">Employees</h2>
+                  <span className="text-[10px] bg-primary/20 text-primary px-2.5 py-0.5 rounded-full font-semibold">
+                    {employees.length}
+                  </span>
+                </div>
+                <Button
+                  onClick={() => {
+                    setAddError("");
+                    setAddSuccess("");
+                    setShowAddModal(true);
+                  }}
+                  className="bg-primary hover:bg-primary/90 text-black text-xs h-8 rounded-xl font-semibold gap-1.5"
+                >
+                  <Plus size={14} /> Add Employee
+                </Button>
+              </div>
+
+              {filteredEmployees.length === 0 ? (
+                <div className="text-center py-16">
+                  <Users size={40} className="mx-auto text-gray-600 mb-3" />
+                  <p className="text-gray-400 text-sm">No employees found.</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto -mx-4 md:-mx-6">
+                  <div className="min-w-[600px] px-4 md:px-6">
+                    <table className="w-full text-sm text-left">
+                      <thead className="text-[10px] text-gray-400 uppercase bg-white/5">
+                        <tr>
+                          <th className="px-4 py-3 rounded-tl-lg">Employee</th>
+                          <th className="px-4 py-3">Email</th>
+                          <th className="px-4 py-3">Department</th>
+                          <th className="px-4 py-3">Role</th>
+                          <th className="px-4 py-3">Status</th>
+                          <th className="px-4 py-3 rounded-tr-lg text-right">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredEmployees.map((emp) => (
+                          <tr
+                            key={emp.id}
+                            onClick={() => setSelectedEmployeeStats(emp)}
+                            className="border-b border-white/5 text-gray-200 hover:bg-white/[0.03] transition-colors cursor-pointer"
+                          >
+                            <td className="px-4 py-3 font-medium text-xs text-white">
+                              {emp.full_name}
+                            </td>
+                            <td className="px-4 py-3 text-xs text-gray-400">
+                              {emp.email}
+                            </td>
+                            <td className="px-4 py-3">
+                              {emp.department ? (
+                                <span className="text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full uppercase font-medium border border-blue-500/20">
+                                  {emp.department}
+                                </span>
+                              ) : (
+                                <span className="text-gray-500 text-xs">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className="text-[10px] bg-white/10 text-gray-300 px-2 py-0.5 rounded-full uppercase font-medium">
+                                {emp.role}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <span
+                                className={`text-[10px] px-2 py-0.5 rounded-full font-medium border ${statusColor(emp.onboarding_status)}`}
+                              >
+                                {emp.onboarding_status}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              <button
+                                onClick={(e) => { e.stopPropagation(); setDeleteTarget(emp); }}
+                                className="p-1.5 rounded-lg hover:bg-red-500/15 text-gray-500 hover:text-red-400 transition-colors inline-flex"
+                                title="Delete employee"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ─── Attendance Tab ─── */}
+          {activeTab === "attendance" && (
+            <div className="space-y-4">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                <h2 className="text-base font-bold text-white">Attendance Records</h2>
+                <div className="flex items-center gap-2 w-full sm:w-auto">
+                  {/* Date Filter */}
+                  <div className="relative flex-1 sm:flex-none">
+                    <select
+                      value={dateFilter}
+                      onChange={(e) => setDateFilter(e.target.value as DateFilter)}
+                      className="appearance-none bg-white/5 border border-white/10 text-white text-xs rounded-xl px-3 py-2 pr-8 w-full sm:w-auto hover:bg-white/10 transition-colors focus:outline-none focus:border-primary/50 cursor-pointer"
+                    >
+                      <option value="today" className="bg-gray-900">Today</option>
+                      <option value="week" className="bg-gray-900">This Week</option>
+                      <option value="month" className="bg-gray-900">This Month</option>
+                      <option value="all" className="bg-gray-900">All Time</option>
+                    </select>
+                    <ChevronDown size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+                  </div>
+                  <Button
+                    onClick={handleExportCSV}
+                    variant="outline"
+                    className="text-xs h-8 bg-white/5 border-white/10 hover:bg-white/10 text-white rounded-xl shrink-0"
+                  >
+                    <Download size={14} className="mr-1.5" /> Export
+                  </Button>
+                </div>
+              </div>
+
+              <p className="text-xs text-gray-500">
+                Showing {groupedTableAttendance.length} group{groupedTableAttendance.length !== 1 ? "s" : ""}
+              </p>
+
+              {groupedTableAttendance.length === 0 ? (
+                <div className="text-center py-16">
+                  <Clock size={40} className="mx-auto text-gray-600 mb-3" />
+                  <p className="text-gray-400 text-sm">No attendance records for this period.</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto -mx-4 md:-mx-6">
+                  <div className="min-w-[600px] px-4 md:px-6">
+                    <table className="w-full text-sm text-left">
+                      <thead className="text-[10px] text-gray-400 uppercase bg-white/5">
+                        <tr>
+                          <th className="px-4 py-3 rounded-tl-lg">Employee</th>
+                          <th className="px-4 py-3">Date</th>
+                          <th className="px-4 py-3">Total Hours</th>
+                          <th className="px-4 py-3">Sessions</th>
+                          <th className="px-4 py-3 rounded-tr-lg">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {groupedTableAttendance.map((group) => (
+                          <tr
+                            key={group.id}
+                            className="border-b border-white/5 text-gray-200 hover:bg-white/[0.03] transition-colors"
+                          >
+                            <td className="px-4 py-3 font-medium text-xs">
+                              <div>{group.employee?.full_name || "Unknown"}</div>
+                              {group.employee?.department && (
+                                <div className="text-[10px] text-blue-400 uppercase tracking-wider mt-0.5">
+                                  {group.employee.department}
+                                </div>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-xs">{group.date}</td>
+                            <td className="px-4 py-3 text-xs font-mono text-primary">
+                              {formatDecimalHours(group.totalHours)}
+                            </td>
+                            <td className="px-4 py-3 text-xs text-gray-400">
+                              {group.clockOutCount > 0 ? `Clocked Out (${group.clockOutCount})` : "—"}
+                            </td>
+                            <td className="px-4 py-3">
+                              <span
+                                className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                                  group.inProgress
+                                    ? "bg-blue-500/20 text-blue-400"
+                                    : "bg-emerald-500/20 text-emerald-400"
+                                }`}
+                              >
+                                {group.inProgress ? "In Progress" : "Complete"}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ─── Audit Log Tab ─── */}
+          {activeTab === "audit" && (
+            <div className="space-y-4">
+              <h2 className="text-base font-bold text-white">System Audit Log</h2>
+
+              {auditLogs.length === 0 ? (
+                <div className="text-center py-16">
+                  <Activity size={40} className="mx-auto text-gray-600 mb-3" />
+                  <p className="text-gray-400 text-sm">No audit logs found.</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {auditLogs.map((log) => (
+                    <div
+                      key={log.id}
+                      className="p-3 bg-white/5 border border-white/10 rounded-xl hover:bg-white/[0.08] transition-colors flex items-center justify-between gap-3"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="text-white text-xs font-medium">
+                          {log.action}{" "}
+                          <span className="text-gray-400 font-normal ml-1">{log.result}</span>
+                        </p>
+                        <p className="text-[10px] text-gray-500 mt-1 truncate">
+                          {log.ip_address || "Unknown IP"} · {log.device_info || "Unknown device"}
+                        </p>
+                      </div>
+                      <span className="text-[10px] text-gray-500 whitespace-nowrap ml-2 shrink-0">
+                        {new Date(log.created_at).toLocaleString()}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ─── Hours This Month Tab ─── */}
+          {activeTab === "hours_month" && (
+            <div className="space-y-4">
+              <h2 className="text-base font-bold text-white">Hours This Month (By Employee)</h2>
+              
+              {employeeStatsMonth.length === 0 ? (
+                <div className="text-center py-16">
+                  <Timer size={40} className="mx-auto text-gray-600 mb-3" />
+                  <p className="text-gray-400 text-sm">No recorded hours for this month.</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto -mx-4 md:-mx-6">
+                  <div className="min-w-[400px] px-4 md:px-6">
+                    <table className="w-full text-sm text-left">
+                      <thead className="text-[10px] text-gray-400 uppercase bg-white/5">
+                        <tr>
+                          <th className="px-4 py-3 rounded-tl-lg">Employee</th>
+                          <th className="px-4 py-3">Department</th>
+                          <th className="px-4 py-3 rounded-tr-lg">Total Hours</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {employeeStatsMonth.map(({ emp, totalHours }) => (
+                          <tr
+                            key={emp.id}
+                            className="border-b border-white/5 text-gray-200 hover:bg-white/[0.03] transition-colors"
+                          >
+                            <td className="px-4 py-3 font-medium text-xs text-white">
+                              {emp.full_name}
+                            </td>
+                            <td className="px-4 py-3">
+                              {emp.department ? (
+                                <span className="text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full uppercase font-medium border border-blue-500/20">
+                                  {emp.department}
+                                </span>
+                              ) : (
+                                <span className="text-gray-500 text-xs">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-xs font-mono text-blue-400">
+                              {formatDecimalHours(totalHours)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ─── Days Worked Tab ─── */}
+          {activeTab === "days_worked" && (
+            <div className="space-y-4">
+              <h2 className="text-base font-bold text-white">Days Worked This Month (By Employee)</h2>
+              
+              {employeeStatsMonth.length === 0 ? (
+                <div className="text-center py-16">
+                  <TrendingUp size={40} className="mx-auto text-gray-600 mb-3" />
+                  <p className="text-gray-400 text-sm">No recorded hours for this month.</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto -mx-4 md:-mx-6">
+                  <div className="min-w-[400px] px-4 md:px-6">
+                    <table className="w-full text-sm text-left">
+                      <thead className="text-[10px] text-gray-400 uppercase bg-white/5">
+                        <tr>
+                          <th className="px-4 py-3 rounded-tl-lg">Employee</th>
+                          <th className="px-4 py-3">Department</th>
+                          <th className="px-4 py-3 rounded-tr-lg">Days Worked</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {employeeStatsMonth.map(({ emp, daysWorked }) => (
+                          <tr
+                            key={emp.id}
+                            className="border-b border-white/5 text-gray-200 hover:bg-white/[0.03] transition-colors"
+                          >
+                            <td className="px-4 py-3 font-medium text-xs text-white">
+                              {emp.full_name}
+                            </td>
+                            <td className="px-4 py-3">
+                              {emp.department ? (
+                                <span className="text-[10px] bg-blue-500/20 text-blue-300 px-2 py-0.5 rounded-full uppercase font-medium border border-blue-500/20">
+                                  {emp.department}
+                                </span>
+                              ) : (
+                                <span className="text-gray-500 text-xs">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-xs font-mono text-purple-400">
+                              {daysWorked} Day{daysWorked !== 1 ? 's' : ''}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ─── Guests Tab ─── */}
+          {activeTab === "guests" && (
+            <div className="space-y-4">
+              <h2 className="text-base font-bold text-white">Guest Invitations</h2>
+
+              {guestInvites.length === 0 ? (
+                <div className="text-center py-16">
+                  <UserCheck size={40} className="mx-auto text-gray-600 mb-3" />
+                  <p className="text-gray-400 text-sm">No guest invitations found.</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto -mx-4 md:-mx-6">
+                  <div className="min-w-[600px] px-4 md:px-6">
+                    <table className="w-full text-sm text-left">
+                      <thead className="text-[10px] text-gray-400 uppercase bg-white/5">
+                        <tr>
+                          <th className="px-4 py-3 rounded-tl-lg">Guest</th>
+                          <th className="px-4 py-3">Count</th>
+                          <th className="px-4 py-3">Invited By</th>
+                          <th className="px-4 py-3">Status</th>
+                          <th className="px-4 py-3 rounded-tr-lg">Created</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {guestInvites.map((inv) => (
+                          <tr
+                            key={inv.id}
+                            className="border-b border-white/5 text-gray-200 hover:bg-white/[0.03] transition-colors"
+                          >
+                            <td className="px-4 py-3 font-medium text-xs text-white" title={parseGuestNames(inv.guest_name)}>{parseGuestNames(inv.guest_name)}</td>
+                            <td className="px-4 py-3 text-xs">
+                              <span className="bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded-full text-[10px] font-bold">
+                                {inv.guest_count} {inv.guest_count === 1 ? 'person' : 'people'}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-xs text-gray-400">{inv.employees?.full_name || 'Unknown'}</td>
+                            <td className="px-4 py-3">
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                inv.status === 'pending' ? 'bg-amber-500/20 text-amber-400' :
+                                inv.status === 'checked_in' ? 'bg-emerald-500/20 text-emerald-400' :
+                                inv.status === 'checked_out' ? 'bg-gray-500/20 text-gray-400' :
+                                inv.status === 'declined' ? 'bg-red-500/20 text-red-400' :
+                                'bg-red-500/20 text-red-400'
+                              }`}>
+                                {inv.status === 'pending' ? 'Pending' : inv.status === 'checked_in' ? 'Inside' : inv.status === 'checked_out' ? 'Left' : inv.status === 'declined' ? 'Declined' : 'Expired'}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-xs text-gray-500">
+                              {new Date(inv.created_at).toLocaleString()}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ═══ Add Employee Modal ═══ */}
+      {showAddModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          {/* Backdrop */}
+          <div
+            className="absolute inset-0 bg-black/70 backdrop-blur-sm"
+            onClick={() => !addLoading && setShowAddModal(false)}
+          />
+          {/* Modal */}
+          <div className="relative w-full max-w-md bg-black/80 backdrop-blur-xl border border-white/10 rounded-2xl p-6 shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+            {/* Close */}
+            <button
+              onClick={() => !addLoading && setShowAddModal(false)}
+              className="absolute top-4 right-4 p-1.5 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
+            >
+              <X size={16} />
+            </button>
+
+            <h3 className="text-base font-bold text-white mb-1">Add New Employee</h3>
+            <p className="text-xs text-gray-400 mb-4">Pre-authorize an employee with their reference photo.</p>
+
+            <div className="space-y-4 max-h-[70vh] overflow-y-auto pr-2 custom-scrollbar">
+              {/* Photo Upload */}
+              <div>
+                <label className="text-xs text-gray-400 mb-1.5 block font-medium">Reference Photo (Required)</label>
+                <div className="relative group">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files[0]) {
+                        setReferenceImage(e.target.files[0]);
+                      }
+                    }}
+                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                    disabled={addLoading}
+                  />
+                  <div className={`w-full border-2 border-dashed ${referenceImage ? 'border-primary/50 bg-primary/5' : 'border-white/10 bg-white/5 group-hover:border-primary/50 group-hover:bg-white/10'} rounded-xl px-4 py-6 text-center transition-all flex flex-col items-center justify-center gap-2`}>
+                    {referenceImage ? (
+                      <>
+                        <div className="w-12 h-12 rounded-full overflow-hidden border-2 border-primary">
+                          <img src={URL.createObjectURL(referenceImage)} alt="Preview" className="w-full h-full object-cover" />
+                        </div>
+                        <p className="text-xs text-primary font-medium">{referenceImage.name}</p>
+                      </>
+                    ) : (
+                      <>
+                        <div className="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center text-gray-400">
+                          <Plus size={20} />
+                        </div>
+                        <div className="space-y-1">
+                          <p className="text-sm font-medium text-gray-300">Click to upload photo</p>
+                          <p className="text-[10px] text-gray-500">Clear, front-facing face photo required</p>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs text-gray-400 mb-1.5 block font-medium">First Name</label>
+                  <input
+                    type="text"
+                    value={newFirstName}
+                    onChange={(e) => setNewFirstName(e.target.value)}
+                    placeholder="e.g. John"
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-colors"
+                    disabled={addLoading}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 mb-1.5 block font-medium">Last Name</label>
+                  <input
+                    type="text"
+                    value={newLastName}
+                    onChange={(e) => setNewLastName(e.target.value)}
+                    placeholder="e.g. Doe"
+                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-colors"
+                    disabled={addLoading}
+                  />
+                </div>
+              </div>
+              
+              <div>
+                <label className="text-xs text-gray-400 mb-1.5 block font-medium">Employee Number</label>
+                <input
+                  type="text"
+                  value={newIdNumber}
+                  onChange={(e) => setNewIdNumber(e.target.value)}
+                  placeholder="e.g. EMP1001"
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-colors"
+                  disabled={addLoading}
+                />
+              </div>
+
+              <div>
+                <label className="text-xs text-gray-400 mb-1.5 block font-medium">Department</label>
+                <input
+                  type="text"
+                  value={newDepartment}
+                  onChange={(e) => setNewDepartment(e.target.value)}
+                  placeholder="e.g. Broadcasting"
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-colors"
+                  disabled={addLoading}
+                />
+              </div>
+
+              {/* Email */}
+              <div>
+                <label className="text-xs text-gray-400 mb-1.5 block font-medium">Email Address</label>
+                <input
+                  type="email"
+                  value={newEmail}
+                  onChange={(e) => setNewEmail(e.target.value)}
+                  placeholder="e.g. john@hopealive.org"
+                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-colors"
+                  disabled={addLoading}
+                />
+              </div>
+
+              {/* Role */}
+              <div>
+                <label className="text-xs text-gray-400 mb-1.5 block font-medium">Role</label>
+                <div className="relative">
+                  <select
+                    value={newRole}
+                    onChange={(e) => setNewRole(e.target.value as "employee" | "admin" | "security_officer")}
+                    className="w-full appearance-none bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/20 transition-colors cursor-pointer"
+                    disabled={addLoading}
+                  >
+                    <option value="employee" className="bg-gray-900">Employee</option>
+                    <option value="security_officer" className="bg-gray-900">Security</option>
+                    <option value="admin" className="bg-gray-900">Admin</option>
+                  </select>
+                  <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
+                </div>
+              </div>
+
+              {/* Feedback */}
+              {addError && (
+                <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-xl">
+                  <AlertTriangle size={14} className="text-red-400 shrink-0" />
+                  <p className="text-xs text-red-400">{addError}</p>
+                </div>
+              )}
+              {addSuccess && (
+                <div className="flex items-center gap-2 p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl">
+                  <CheckCircle2 size={14} className="text-emerald-400 shrink-0" />
+                  <p className="text-xs text-emerald-400">{addSuccess}</p>
+                </div>
+              )}
+
+              {/* Submit */}
+              <Button
+                onClick={handleAddEmployee}
+                disabled={addLoading}
+                className="w-full bg-primary hover:bg-primary/90 text-black font-semibold rounded-xl h-10 text-sm"
+              >
+                {addLoading ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin mr-2" /> Adding…
+                  </>
+                ) : (
+                  <>
+                    <Plus size={16} className="mr-1" /> Add Employee
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══ Delete Confirmation Modal ═══ */}
+      <AnimatePresence>
+        {deleteTarget && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-[#111] border border-gray-800 rounded-2xl p-6 w-full max-w-sm"
+            >
+              <h3 className="text-xl font-bold text-white mb-2">Delete Employee?</h3>
+              <p className="text-gray-400 text-sm mb-6">
+                Are you sure you want to remove <span className="text-amber-500 font-bold">{deleteTarget.full_name}</span>? This action cannot be undone.
+              </p>
+              <div className="flex gap-3">
+                <Button
+                  variant="outline"
+                  disabled={deleteLoading}
+                  className="flex-1 bg-white/5 border-white/10 hover:bg-white/10 text-white rounded-xl h-9 text-xs"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  onClick={handleDeleteEmployee}
+                  disabled={deleteLoading}
+                  className="flex-1 bg-red-500 hover:bg-red-600 text-white rounded-xl h-9 text-xs"
+                >
+                  {deleteLoading ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <>
+                      <Trash2 size={14} className="mr-1" /> Delete
+                    </>
+                  )}
+                </Button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Employee Details & Guest Analytics Modal */}
+      <AnimatePresence>
+        {selectedEmployeeStats && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 20 }}
+              className="bg-[#111] border border-gray-800 rounded-2xl w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden shadow-2xl"
+            >
+              {/* Header */}
+              <div className="p-6 border-b border-gray-800 flex justify-between items-start bg-white/[0.02]">
+                <div>
+                  <h3 className="text-2xl font-bold text-white mb-2">{selectedEmployeeStats.full_name}</h3>
+                  <div className="flex gap-2">
+                    <span className="text-[10px] bg-amber-500/20 text-amber-500 px-2 py-0.5 rounded-full uppercase font-bold tracking-wider border border-amber-500/20">{selectedEmployeeStats.role}</span>
+                    {selectedEmployeeStats.department && (
+                      <span className="text-[10px] bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full uppercase font-bold tracking-wider border border-blue-500/20">{selectedEmployeeStats.department}</span>
+                    )}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setSelectedEmployeeStats(null)}
+                  className="p-2 bg-white/5 hover:bg-white/10 rounded-full text-gray-400 hover:text-white transition-colors"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              {/* Body */}
+              <div className="p-6 overflow-y-auto flex-1 bg-black space-y-8">
+                {/* Guest Analytics Section */}
+                <div>
+                  <h4 className="text-xs font-black text-gray-500 uppercase tracking-widest mb-4 flex items-center gap-2">
+                    <UserCheck size={16} className="text-amber-500" />
+                    Guest Invitation Analytics
+                  </h4>
+                  
+                  {(() => {
+                    const empInvites = guestInvites.filter(i => i.host_employee_id === selectedEmployeeStats.id);
+                    const linksSent = empInvites.length;
+                    const linksOpened = empInvites.reduce((sum, i) => sum + (i.views || 0), 0);
+                    const admitted = empInvites.filter(i => i.status === 'checked_in' || i.status === 'checked_out').length;
+                    const expired = empInvites.filter(i => i.status === 'expired').length;
+                    const declined = empInvites.filter(i => i.status === 'declined').length;
+                    const photos = empInvites.filter(i => i.id_photo_url).map(i => ({ url: i.id_photo_url, date: i.created_at, names: parseGuestNames(i.guest_name) }));
+
+                    return (
+                      <div className="space-y-8">
+                        {/* Stats Grid */}
+                        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                          <div className="bg-white/5 border border-white/10 rounded-2xl p-4 text-center">
+                            <p className="text-3xl font-black text-white">{linksSent}</p>
+                            <p className="text-[10px] text-gray-400 uppercase font-bold mt-2">Links Sent</p>
+                          </div>
+                          <div className="bg-blue-500/5 border border-blue-500/10 rounded-2xl p-4 text-center">
+                            <p className="text-3xl font-black text-blue-400">{linksOpened}</p>
+                            <p className="text-[10px] text-blue-400/70 uppercase font-bold mt-2">Times Opened</p>
+                          </div>
+                          <div className="bg-emerald-500/5 border border-emerald-500/10 rounded-2xl p-4 text-center">
+                            <p className="text-3xl font-black text-emerald-400">{admitted}</p>
+                            <p className="text-[10px] text-emerald-400/70 uppercase font-bold mt-2">Checked In</p>
+                          </div>
+                          <div className="bg-red-500/5 border border-red-500/10 rounded-2xl p-4 text-center">
+                            <p className="text-3xl font-black text-red-400">{declined}</p>
+                            <p className="text-[10px] text-red-400/70 uppercase font-bold mt-2">Declined</p>
+                          </div>
+                          <div className="bg-gray-500/5 border border-gray-500/10 rounded-2xl p-4 text-center">
+                            <p className="text-3xl font-black text-gray-500">{expired}</p>
+                            <p className="text-[10px] text-gray-500/70 uppercase font-bold mt-2">Expired</p>
+                          </div>
+                        </div>
+
+                        {/* ID Photos Gallery */}
+                        {photos.length > 0 && (
+                          <div className="space-y-4 pt-6 border-t border-gray-800/50">
+                            <h5 className="text-xs font-black text-gray-500 uppercase tracking-widest">ID Photos Captured</h5>
+                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                              {photos.map((photo, i) => (
+                                <div key={i} className="group relative aspect-[4/3] bg-gray-900 rounded-xl overflow-hidden border border-white/5 shadow-lg">
+                                  <img 
+                                    src={photo.url} 
+                                    alt={`ID for ${photo.names}`}
+                                    className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110"
+                                  />
+                                  <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex flex-col justify-end p-3 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                                    <span className="text-sm font-bold text-white leading-tight">{photo.names}</span>
+                                    <span className="text-[10px] font-medium text-amber-500/80 mt-1">{new Date(photo.date).toLocaleDateString()}</span>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        
+                        {photos.length === 0 && linksSent > 0 && (
+                          <div className="p-8 bg-white/[0.02] rounded-2xl border border-dashed border-white/10 text-center">
+                            <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mx-auto mb-3">
+                              <Camera size={20} className="text-gray-500" />
+                            </div>
+                            <p className="text-sm font-medium text-gray-400">No ID photos captured yet.</p>
+                            <p className="text-xs text-gray-500 mt-1">Photos taken by Security will appear here.</p>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ═══ Toast Notification ═══ */}
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom-4 fade-in duration-300">
+          <div
+            className={`px-4 py-2.5 rounded-xl border shadow-2xl backdrop-blur-xl flex items-center gap-2 text-xs font-medium ${
+              toast.type === "success"
+                ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-400"
+                : "bg-red-500/15 border-red-500/30 text-red-400"
+            }`}
+          >
+            {toast.type === "success" ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}
+            {toast.message}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

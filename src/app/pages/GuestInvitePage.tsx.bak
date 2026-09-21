@@ -1,0 +1,207 @@
+import { useState, useEffect } from "react";
+import { useParams } from "react-router";
+import QRCode from "react-qr-code";
+import { supabase } from "../../lib/supabase";
+
+export default function GuestInvitePage() {
+  const { token } = useParams<{ token: string }>();
+  const [invite, setInvite] = useState<any>(null);
+  const [hostName, setHostName] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [timestamp, setTimestamp] = useState(Date.now());
+
+  // Rotate QR code timestamp every 30 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTimestamp(Date.now());
+    }, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const fetchInvite = async () => {
+      if (!token) {
+        setError("Invalid invitation link.");
+        setLoading(false);
+        return;
+      }
+
+      const { data, error: fetchError } = await supabase
+        .from("guest_invites")
+        .select("*, employees!host_employee_id(full_name)")
+        .eq("token", token)
+        .maybeSingle();
+
+      if (fetchError || !data) {
+        console.error("Fetch error:", fetchError);
+        setError(`This invitation was not found or has expired. ${fetchError?.message || ""}`);
+        setLoading(false);
+        return;
+      }
+
+      let inviteData = data;
+      const createdTime = new Date(data.created_at).getTime();
+      const isExpired = (Date.now() - createdTime) > 24 * 60 * 60 * 1000;
+      
+      if (isExpired && data.status === "pending") {
+        await supabase.from("guest_invites").update({ status: "expired" }).eq("id", data.id);
+        inviteData.status = "expired";
+      } else {
+        if (!sessionStorage.getItem(`viewed_${token}`)) {
+          await supabase.from("guest_invites").update({ views: (data.views || 0) + 1 }).eq("id", data.id);
+          sessionStorage.setItem(`viewed_${token}`, "true");
+        }
+      }
+
+      setInvite(inviteData);
+      setHostName(data.employees?.full_name || "Staff Member");
+      setLoading(false);
+    };
+
+    fetchInvite();
+
+    // Subscribe to live updates on this invite
+    const channel = supabase
+      .channel(`invite-${token}`)
+      .on("postgres_changes", {
+        event: "UPDATE",
+        schema: "public",
+        table: "guest_invites",
+        filter: `token=eq.${token}`,
+      }, (payload) => {
+        setInvite(payload.new);
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  }, [token]);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center p-4 font-sans">
+        <div className="w-full max-w-[400px] bg-black/60 backdrop-blur-xl border border-white/10 rounded-2xl p-8 text-center">
+          <span className="w-8 h-8 border-4 border-amber-500 border-t-transparent rounded-full animate-spin mx-auto block" />
+          <p className="text-sm text-gray-400 mt-4">Loading your invitation...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center p-4 font-sans">
+        <div className="w-full max-w-[400px] bg-black/60 backdrop-blur-xl border border-white/10 rounded-2xl p-8 text-center space-y-4">
+          <div className="w-16 h-16 bg-red-500/10 rounded-full flex items-center justify-center mx-auto">
+            <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-red-500"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+          </div>
+          <h1 className="text-xl font-bold text-white">Invitation Not Found</h1>
+          <p className="text-sm text-gray-400">{error}</p>
+        </div>
+      </div>
+    );
+  }
+
+  const statusStyles: Record<string, { bg: string; text: string; label: string }> = {
+    pending: { bg: "bg-amber-500/20", text: "text-amber-400", label: "Awaiting Arrival" },
+    checked_in: { bg: "bg-emerald-500/20", text: "text-emerald-400", label: "Checked In" },
+    checked_out: { bg: "bg-gray-500/20", text: "text-gray-400", label: "Visit Complete" },
+    expired: { bg: "bg-red-500/20", text: "text-red-400", label: "Expired" },
+  };
+
+  const currentStatus = statusStyles[invite.status] || statusStyles.pending;
+  const qrValue = JSON.stringify({ type: "har_guest", token: invite.token, count: invite.guest_count, ts: timestamp });
+
+  let displayNames = invite.guest_name;
+  try {
+    const parsed = JSON.parse(invite.guest_name);
+    if (Array.isArray(parsed)) {
+      displayNames = parsed.length === 1 ? parsed[0] : parsed.join(", ");
+    }
+  } catch (e) {}
+
+  return (
+    <div className="min-h-screen bg-black flex items-center justify-center p-4 font-sans">
+      <div className="w-full max-w-[400px] space-y-5">
+        {/* Header */}
+        <div className="text-center space-y-2">
+          <img src="/logo.png" alt="Hope Alive Radio" className="h-14 mx-auto object-contain" />
+          <h1 className="text-2xl font-bold text-white tracking-tight">Guest Pass</h1>
+          <p className="text-xs text-gray-500 uppercase tracking-widest">Hope Alive Radio</p>
+        </div>
+
+        {/* Main Card */}
+        <div className="bg-white/[0.04] backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden">
+          {/* QR Code Section */}
+          <div className="p-6 flex justify-center">
+            {invite.status === "expired" || invite.status === "declined" ? (
+              <div className="w-full h-[252px] bg-red-500/5 border border-red-500/10 rounded-2xl flex flex-col items-center justify-center p-6 text-center space-y-3">
+                <div className="w-12 h-12 bg-red-500/10 rounded-full flex items-center justify-center">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-red-400"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                </div>
+                <p className="text-red-400 font-bold">This pass is no longer valid</p>
+                <p className="text-xs text-red-400/70">Please contact your host for a new invitation.</p>
+              </div>
+            ) : (
+              <div className="relative bg-white rounded-2xl p-4 shadow-2xl shadow-amber-500/10">
+                <QRCode
+                  value={qrValue}
+                  size={220}
+                  bgColor="#FFFFFF"
+                  fgColor="#000000"
+                  level="H"
+                />
+                {/* Guest Count Overlay */}
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="w-14 h-14 rounded-full bg-black flex items-center justify-center border-[3px] border-amber-500 shadow-lg">
+                    <span className="text-xl font-black text-amber-500">{invite.guest_count}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Invite Details */}
+          <div className="px-6 pb-6 space-y-4">
+            {/* Status Badge */}
+            <div className="flex justify-center">
+              <span className={`px-4 py-1.5 rounded-full text-xs font-bold tracking-wide ${currentStatus.bg} ${currentStatus.text}`}>
+                {currentStatus.label}
+              </span>
+            </div>
+
+            {/* Info Grid */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="bg-white/5 rounded-xl p-3 border border-white/5">
+                <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">
+                  {invite.guest_count === 1 ? "Guest Name" : "Guest Names"}
+                </p>
+                <p className="text-sm text-white font-semibold truncate">{displayNames}</p>
+              </div>
+              <div className="bg-white/5 rounded-xl p-3 border border-white/5">
+                <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Guests Allowed</p>
+                <p className="text-sm text-white font-semibold">{invite.guest_count} {invite.guest_count === 1 ? "person" : "people"}</p>
+              </div>
+              <div className="bg-white/5 rounded-xl p-3 border border-white/5 col-span-2">
+                <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">Invited By</p>
+                <p className="text-sm text-white font-semibold">{hostName}</p>
+              </div>
+            </div>
+
+            {/* Instructions */}
+            <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-4">
+              <p className="text-xs text-amber-300/80 leading-relaxed text-center">
+                Present this QR code to Security at the gate. This pass is valid for <strong className="text-amber-400">{invite.guest_count}</strong> {invite.guest_count === 1 ? "guest" : "guests"}.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <p className="text-center text-[10px] text-gray-600">
+          {new Date(invite.created_at).toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}
+        </p>
+      </div>
+    </div>
+  );
+}

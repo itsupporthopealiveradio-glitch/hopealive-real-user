@@ -1,0 +1,9 @@
+{
+  "appId": "com.hopealive.radio",
+  "appName": "Hope Alive Radio",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https",
+    "cleartext": false
+  }
+}
